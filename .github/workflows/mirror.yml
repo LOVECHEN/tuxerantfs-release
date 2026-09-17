@@ -33,6 +33,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "${BASE:-}" ]; then echo "::error::secret TUXERA_SDIC_BASE 未设置"; exit 1; fi
+          echo "::add-mask::$BASE"   # 双保险: 显式登记遮蔽, 万一任何输出带上端点也会被 *** 掉
           made=0
           STABLE_BUILD=""
 
@@ -47,10 +48,10 @@ jobs:
             esac
           }
 
-          # make_release <prefix> <disp> <build> <ver> <date> <minos> <kext> <inst_url> <sig_url> <app> <prerelease yes/no> <latest yes/no> <source>
+          # make_release <prefix> <disp> <build> <ver> <date> <minos> <kext> <inst_url> <sig_url> <app> <prerelease yes/no> <latest yes/no>
           make_release () {
             local prefix="$1" disp="$2" build="$3" ver="$4" date="$5" minos="$6" kext="$7"
-            local inst="$8" sig="$9" app="${10}" prerelease="${11}" mark_latest="${12}" source="${13}"
+            local inst="$8" sig="$9" app="${10}" prerelease="${11}" mark_latest="${12}"
             local tag="${prefix}-${disp}.${build}"
             [ -n "$app" ] || app="Tuxera NTFS for Mac"
 
@@ -99,8 +100,9 @@ jobs:
             local prefix="$1" file="$2" prerelease="$3" mark_latest="$4"
             local src="$BASE/$file"
             echo "::group::channel=$prefix ($file)"
-            if ! curl -fsSL --retry 3 "$src" -o sdic.txt; then
-              echo "拉取失败 $src"; echo "::endgroup::"; return 0
+            # 2>/dev/null: 失败时 curl 的报错会带完整 URL(含端点), 不让它进日志; 仅凭退出码判断
+            if ! curl -fsSL --retry 3 "$src" -o sdic.txt 2>/dev/null; then
+              echo "拉取失败: 通道 $prefix ($file)"; echo "::endgroup::"; return 0
             fi
             local ver disp build date minos kext inst sig app
             ver="$(sdic_get sdic.txt Version)";        disp="$(sdic_get sdic.txt DisplayVersion)"
@@ -117,7 +119,7 @@ jobs:
               echo "testing == stable ($build), 跳过重复镜像"; echo "::endgroup::"; return 0
             fi
             [ "$prefix" = "stable" ] && STABLE_BUILD="$build"
-            make_release "$prefix" "$disp" "$build" "$ver" "$date" "$minos" "$kext" "$inst" "$sig" "$app" "$prerelease" "$mark_latest" "$src"
+            make_release "$prefix" "$disp" "$build" "$ver" "$date" "$minos" "$kext" "$inst" "$sig" "$app" "$prerelease" "$mark_latest"
             echo "::endgroup::"
           }
 
@@ -130,7 +132,7 @@ jobs:
             make_release "stable" "26" "r0" "2026.0.0" "" "10.4" "" \
               "http://download.tuxera.com/mac/tuxerantfs_26_r0.dmg" \
               "http://download.tuxera.com/mac/tuxerantfs_26_r0.dmg.sig" \
-              "Tuxera NTFS for Mac" "no" "no" "历史归档：官方 CDN 直链 tuxerantfs_26_r0.dmg（已不在当前 SDIC manifest）"
+              "Tuxera NTFS for Mac" "no" "no"
           fi
 
           echo "本次新建 Release: $made"
