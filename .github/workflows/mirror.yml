@@ -28,12 +28,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BASE: ${{ secrets.TUXERA_SDIC_BASE }}
+          DL: ${{ secrets.TUXERA_DL_BASE }}
           SEED_ARCHIVE: ${{ github.event.inputs.seed_archive == '' && 'true' || github.event.inputs.seed_archive }}
         run: |
           set -euo pipefail
 
-          if [ -z "${BASE:-}" ]; then echo "::error::secret TUXERA_SDIC_BASE 未设置"; exit 1; fi
-          echo "::add-mask::$BASE"   # 双保险: 显式登记遮蔽, 万一任何输出带上端点也会被 *** 掉
+          if [ -z "${BASE:-}" ] || [ -z "${DL:-}" ]; then
+            echo "::error::secret TUXERA_SDIC_BASE / TUXERA_DL_BASE 未设置"; exit 1
+          fi
+          # 遮蔽两个 URL 基址; 后面对每条完整 inst/sig URL 再单独 add-mask -> 日志里所有 Tuxera URL 全变 ***
+          echo "::add-mask::$BASE"
+          echo "::add-mask::$DL"
           made=0
           STABLE_BUILD=""
 
@@ -52,6 +57,9 @@ jobs:
           make_release () {
             local prefix="$1" disp="$2" build="$3" ver="$4" date="$5" minos="$6" kext="$7"
             local inst="$8" sig="$9" app="${10}" prerelease="${11}" mark_latest="${12}"
+            # 完整下载 URL 单独遮蔽 (含安装包直链, 不只是域名/前缀)
+            [ -n "$inst" ] && echo "::add-mask::$inst"
+            [ -n "$sig" ]  && echo "::add-mask::$sig"
             local tag="${prefix}-${disp}.${build}"
             [ -n "$app" ] || app="Tuxera NTFS for Mac"
 
@@ -60,21 +68,21 @@ jobs:
             fi
             echo "::group::create $tag"
             local dmg; dmg="$(basename "$inst")"
-            echo "下载 $inst"
-            if ! curl -fL --retry 3 "$inst" -o "$dmg"; then
+            echo "下载 $dmg"
+            if ! curl -fL --retry 3 "$inst" -o "$dmg" 2>/dev/null; then
               echo "dmg 下载失败, skip $tag"; rm -f "$dmg"; echo "::endgroup::"; return 0
             fi
             local files=("$dmg")
             if [ -n "$sig" ]; then
               local sigfile; sigfile="$(basename "$sig")"
-              if curl -fL --retry 3 "$sig" -o "$sigfile"; then files+=("$sigfile"); else echo "无 .sig, 跳过签名文件"; fi
+              if curl -fL --retry 3 "$sig" -o "$sigfile" 2>/dev/null; then files+=("$sigfile"); else echo "无 .sig, 跳过签名文件"; fi
             fi
             sha256sum "${files[@]}" > SHA256SUMS.txt
             files+=("SHA256SUMS.txt")
 
             # 缺失日期时从官方 CDN Last-Modified 推断, 不臆造
             if [ -z "$date" ]; then
-              date="$(curl -sIL "$inst" | sed -n 's/^[Ll]ast-[Mm]odified:[[:space:]]*//p' | tail -n1 | tr -d '\r')"
+              date="$(curl -sIL "$inst" 2>/dev/null | sed -n 's/^[Ll]ast-[Mm]odified:[[:space:]]*//p' | tail -n1 | tr -d '\r')"
             fi
 
             local sha; sha="$(cat SHA256SUMS.txt)"
@@ -110,7 +118,7 @@ jobs:
             minos="$(sdic_get sdic.txt MinOSVersion)"; kext="$(sdic_get sdic.txt KextVersion)"
             inst="$(sdic_get sdic.txt Installer)";     sig="$(sdic_get sdic.txt Signature)"
             app="$(sdic_get sdic.txt AppName)"
-            echo "解析: disp=$disp build=$build inst=$inst"
+            echo "解析: disp=$disp build=$build"
             if [ -z "$disp" ] || [ -z "$build" ] || [ -z "$inst" ]; then
               echo "字段缺失, skip"; echo "::endgroup::"; return 0
             fi
@@ -130,8 +138,8 @@ jobs:
           # 历史归档: 26 (r0) — 已不在当前 manifest, 但官方 CDN 仍在线
           if [ "${SEED_ARCHIVE}" = "true" ]; then
             make_release "stable" "26" "r0" "2026.0.0" "" "10.4" "" \
-              "http://download.tuxera.com/mac/tuxerantfs_26_r0.dmg" \
-              "http://download.tuxera.com/mac/tuxerantfs_26_r0.dmg.sig" \
+              "$DL/tuxerantfs_26_r0.dmg" \
+              "$DL/tuxerantfs_26_r0.dmg.sig" \
               "Tuxera NTFS for Mac" "no" "no"
           fi
 
