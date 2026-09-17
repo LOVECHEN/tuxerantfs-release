@@ -1,0 +1,7 @@
+# 安装包只作为 Release 资产, 不进仓库
+*.dmg
+*.sig
+*.zip
+SHA256SUMS.txt
+sdic.txt
+feed.xml

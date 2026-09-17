@@ -1,0 +1,161 @@
+name: mirror
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # 每 6 小时检查官方 SDIC 更新清单
+  workflow_dispatch:
+    inputs:
+      seed_archive:
+        description: '本次是否补齐历史归档版本 (r0 等)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mirror Tuxera NTFS (stable + testing SDIC channels)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ secrets.TUXERA_SDIC_BASE }}
+          SEED_ARCHIVE: ${{ github.event.inputs.seed_archive == '' && 'true' || github.event.inputs.seed_archive }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BASE:-}" ]; then echo "::error::secret TUXERA_SDIC_BASE 未设置"; exit 1; fi
+          made=0
+          STABLE_BUILD=""
+
+          # SDIC 是 "Key: value" 每行一对的纯文本字典
+          sdic_get () { sed -n "s/^$2:[[:space:]]*//p" "$1" | head -n1 | tr -d '\r'; }
+
+          channel_label () {
+            case "$1" in
+              stable)  echo "Stable" ;;
+              testing) echo "Testing" ;;
+              *)       echo "$1" ;;
+            esac
+          }
+
+          # make_release <prefix> <disp> <build> <ver> <date> <minos> <kext> <inst_url> <sig_url> <app> <prerelease yes/no> <latest yes/no> <source>
+          make_release () {
+            local prefix="$1" disp="$2" build="$3" ver="$4" date="$5" minos="$6" kext="$7"
+            local inst="$8" sig="$9" app="${10}" prerelease="${11}" mark_latest="${12}" source="${13}"
+            local tag="${prefix}-${disp}.${build}"
+            [ -n "$app" ] || app="Tuxera NTFS for Mac"
+
+            if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "skip $tag (已存在)"; return 0
+            fi
+            echo "::group::create $tag"
+            local dmg; dmg="$(basename "$inst")"
+            echo "下载 $inst"
+            if ! curl -fL --retry 3 "$inst" -o "$dmg"; then
+              echo "dmg 下载失败, skip $tag"; rm -f "$dmg"; echo "::endgroup::"; return 0
+            fi
+            local files=("$dmg")
+            if [ -n "$sig" ]; then
+              local sigfile; sigfile="$(basename "$sig")"
+              if curl -fL --retry 3 "$sig" -o "$sigfile"; then files+=("$sigfile"); else echo "无 .sig, 跳过签名文件"; fi
+            fi
+            sha256sum "${files[@]}" > SHA256SUMS.txt
+            files+=("SHA256SUMS.txt")
+
+            # 缺失日期时从官方 CDN Last-Modified 推断, 不臆造
+            if [ -z "$date" ]; then
+              date="$(curl -sIL "$inst" | sed -n 's/^[Ll]ast-[Mm]odified:[[:space:]]*//p' | tail -n1 | tr -d '\r')"
+            fi
+
+            local sha; sha="$(cat SHA256SUMS.txt)"
+            local label; label="$(channel_label "$prefix")"
+            local notes
+            notes="$(printf '## Tuxera NTFS for Mac\n\n| | |\n|---|---|\n| **App** | %s（`com.tuxera.ntfs.mac.prefpane`） |\n| **版本** | %s（Version %s, build %s） |\n| **通道** | %s |\n| **发布日期** | %s |\n| **最低系统** | macOS %s |\n| **Kext** | %s |\n| **平台** | macOS（i386 / ppc / x86_64 / arm64 universal） |\n| **文件** | `%s` |\n\n> 官方原版安装镜像 (.dmg)，未经任何修改，逐字节镜像；仅作版本归档 / 离线留存。附官方 `.sig`（供 Tuxera 更新器 RSA 校验）与 `SHA256SUMS.txt`。\n\n**SHA-256**\n```\n%s\n```\n' \
+              "$app" "$disp" "${ver:-?}" "$build" "$label" "${date:-?}" "${minos:-?}" "${kext:-?}" "$dmg" "$sha")"
+
+            local latest_flag="--latest=false"; [ "$mark_latest" = "yes" ] && latest_flag="--latest=true"
+            local pre_flag="";                  [ "$prerelease" = "yes" ] && pre_flag="--prerelease"
+
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+              --title "$label · Tuxera NTFS $disp ($build)" \
+              --notes "$notes" $latest_flag $pre_flag "${files[@]}"
+            rm -f "${files[@]}"
+            made=$((made+1))
+            echo "created $tag"
+            echo "::endgroup::"
+          }
+
+          # make_from_sdic <prefix> <sdic file> <prerelease yes/no> <latest yes/no>
+          make_from_sdic () {
+            local prefix="$1" file="$2" prerelease="$3" mark_latest="$4"
+            local src="$BASE/$file"
+            echo "::group::channel=$prefix ($file)"
+            if ! curl -fsSL --retry 3 "$src" -o sdic.txt; then
+              echo "拉取失败 $src"; echo "::endgroup::"; return 0
+            fi
+            local ver disp build date minos kext inst sig app
+            ver="$(sdic_get sdic.txt Version)";        disp="$(sdic_get sdic.txt DisplayVersion)"
+            build="$(sdic_get sdic.txt Build)";        date="$(sdic_get sdic.txt Date)"
+            minos="$(sdic_get sdic.txt MinOSVersion)"; kext="$(sdic_get sdic.txt KextVersion)"
+            inst="$(sdic_get sdic.txt Installer)";     sig="$(sdic_get sdic.txt Signature)"
+            app="$(sdic_get sdic.txt AppName)"
+            echo "解析: disp=$disp build=$build inst=$inst"
+            if [ -z "$disp" ] || [ -z "$build" ] || [ -z "$inst" ]; then
+              echo "字段缺失, skip"; echo "::endgroup::"; return 0
+            fi
+            # testing 与 stable 同一 build 时不重复归档
+            if [ "$prefix" = "testing" ] && [ "$build" = "$STABLE_BUILD" ]; then
+              echo "testing == stable ($build), 跳过重复镜像"; echo "::endgroup::"; return 0
+            fi
+            [ "$prefix" = "stable" ] && STABLE_BUILD="$build"
+            make_release "$prefix" "$disp" "$build" "$ver" "$date" "$minos" "$kext" "$inst" "$sig" "$app" "$prerelease" "$mark_latest" "$src"
+            echo "::endgroup::"
+          }
+
+          # 正式通道 -> 标记 latest; 预发布通道 -> prerelease, 不抢 latest
+          make_from_sdic "stable"  "stable.sdic.txt"  "no"  "yes"
+          make_from_sdic "testing" "testing.sdic.txt" "yes" "no"
+
+          # 历史归档: 26 (r0) — 已不在当前 manifest, 但官方 CDN 仍在线
+          if [ "${SEED_ARCHIVE}" = "true" ]; then
+            make_release "stable" "26" "r0" "2026.0.0" "" "10.4" "" \
+              "http://download.tuxera.com/mac/tuxerantfs_26_r0.dmg" \
+              "http://download.tuxera.com/mac/tuxerantfs_26_r0.dmg.sig" \
+              "Tuxera NTFS for Mac" "no" "no" "历史归档：官方 CDN 直链 tuxerantfs_26_r0.dmg（已不在当前 SDIC manifest）"
+          fi
+
+          echo "本次新建 Release: $made"
+
+      - name: Refresh MIRRORED.md manifest (keep-alive)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "# 已归档版本"
+            echo
+            echo "> 由 mirror workflow 自动刷新 · $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo "| 通道 | 标题 | tag | 发布(UTC) |"
+            echo "|---|---|---|---|"
+            gh release list -R "$GITHUB_REPOSITORY" --limit 300 --json tagName,name,createdAt \
+              --jq 'sort_by(.tagName)|reverse|.[]|"| \(.tagName|split("-")[0]) | \(.name) | \(.tagName) | \(.createdAt[0:16]|sub("T";" ")) |"'
+          } > MIRRORED.md
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add MIRRORED.md
+          if ! git diff --cached --quiet -- MIRRORED.md; then
+            git commit -m "chore: refresh mirrored manifest" && git push
+          else
+            echo "MIRRORED.md 无变化"
+          fi
